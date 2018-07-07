@@ -81,7 +81,7 @@ static inline void init_list_entry(struct list_head *entry)
 	entry->next = LIST_POISON1;
 	entry->prev = LIST_POISON2;
 }
-static inline int list_entry_orphan(struct list_head *entry)
+static inline int list_entry_poisoned(struct list_head *entry)
 {
 	return entry->next == LIST_POISON1;
 }
@@ -200,10 +200,10 @@ static inline int list_empty(const struct list_head *head)
 
 /* Vector hash entry (for caches). */
 struct h_cache {
-	struct list_head list;
+	struct list_head bucket_list_index;
 	struct h_bucket *bucket;
 	struct h_table *table;
-	struct list_head idle_list;
+	struct list_head idle_list_index;
 	/* Time for the latest `h_entry_put()` operation. */
 	time_t last_put;
 	int refs;
@@ -265,13 +265,14 @@ static struct h_cache *__h_cache_try_get(struct h_table *ht, void *key,
 {
 	struct h_bucket *b = &ht->base[ht->ops->hash(key) & (ht->size - 1)];
 	struct h_cache *he;
-	
-	list_for_each_entry(he, &b->chain, list) {
+
+	/* loop bucket and cast the bucket_list_index ptr to h_cache. */
+	list_for_each_entry(he, &b->chain, bucket_list_index) {
 		if (ht->ops->comp_key(he, key) == 0) {
-			/* Pop-up from idle queue when reference leaves 0. */
+			/* Pop-up from idle queue when reference no longer is 0. */
 			if (++he->refs == 1) {
-				if (!list_entry_orphan(&he->idle_list))
-					list_del(&he->idle_list);
+				if (!list_entry_poisoned(&he->idle_list_index))
+					list_del(&he->idle_list_index);
 			}
 			/* Invoke the call back to do modifications. */
 			if (modify)
@@ -297,12 +298,12 @@ static struct h_cache *__h_cache_try_get(struct h_table *ht, void *key,
 	/* Initialize the base class. */
 	he->bucket = b;
 	he->table = ht;
-	init_list_entry(&he->list);
+	init_list_entry(&he->bucket_list_index);
 	//init_timer(&he->timer);
-	init_list_entry(&he->idle_list);
+	init_list_entry(&he->idle_list_index);
 	he->last_put = 0;
 	he->refs = 1;
-	list_add(&he->list, &b->chain);
+	list_add(&he->bucket_list_index, &b->chain);
 	
 	h_table_len_inc(ht);
 	
@@ -316,16 +317,20 @@ static inline struct h_cache *h_entry_try_get(struct h_table *ht, void *key,
 	return __h_cache_try_get(ht, key, create, modify);
 }
 
+
+/**
+ * Put connection to idle_queue, and update last_put timer.
+ */
 static void h_entry_put(struct h_cache *he)
 {
 	struct h_table *ht = he->table;
 	
 	if (--he->refs == 0) {
 		/* Push unused entry to TAIL of the idle queue. */
-		if (list_entry_orphan(&he->idle_list)) {
+		if (list_entry_poisoned(&he->idle_list_index)) {
 			/* Timer will check this to determine when it should be removed. */
 			he->last_put = time(NULL);
-			list_add_tail(&he->idle_list, &ht->idle_queue);
+			list_add_tail(&he->idle_list_index, &ht->idle_queue);
 		} else {
 			fprintf(stderr, "%s(): entry(0x%08lx) is already in idle queue!\n",
 				__FUNCTION__, (unsigned long)he);
@@ -339,10 +344,10 @@ static int h_table_clear(struct h_table *ht)
 	struct h_cache *he;
 	
 	while (!list_empty(&ht->idle_queue)) {
-		he = list_first_entry(&ht->idle_queue, struct h_cache, idle_list);
+		he = list_first_entry(&ht->idle_queue, struct h_cache, idle_list_index);
 
-		list_del(&he->idle_list);
-		list_del(&he->list);
+		list_del(&he->idle_list_index);
+		list_del(&he->bucket_list_index);
 
 		ht->ops->release(he);
 		h_table_len_dec(ht);
@@ -374,14 +379,14 @@ static void __h_table_timeo_check(struct h_table *ht)
 	struct h_cache *he;
 
 	while (!list_empty(&ht->idle_queue)) {
-		he = list_first_entry(&ht->idle_queue, struct h_cache, idle_list);
+		he = list_first_entry(&ht->idle_queue, struct h_cache, idle_list_index);
 
 		if ((time(NULL) - he->last_put <= ht->timeo) &&
 			(h_table_len(ht) < ht->max_len * 9 / 10) )
 			break;
 
-		list_del(&he->idle_list);
-		list_del(&he->list);
+		list_del(&he->idle_list_index);
+		list_del(&he->bucket_list_index);
 
 		ht->ops->release(he);
 		h_table_len_dec(ht);
@@ -752,7 +757,11 @@ static struct proxy_conn *get_conn_by_cli_addr(struct sockaddr_storage *cli_addr
 	if (!(he = h_entry_try_get(&g_conn_tbl, cli_addr, __proxy_conn_create_fn,
 		__proxy_conn_modify_fn)))
 		return NULL;
-	/* Single threaded, don't have to hold it. */
+	/**
+	 * Single threaded, don't have to hold it.
+	 * We should release the reference after connection used.
+	 * Well, it's async, just put it here.
+	 */
 	h_entry_put(he);
 	
 	return container_of(he, struct proxy_conn, h_cache);
@@ -1000,8 +1009,14 @@ int main(int argc, char *argv[])
 				conn = get_conn_by_evptr(evptr);
 				if ((rlen = recv(conn->svr_sock, buffer, sizeof(buffer), 0))
 					<= 0) {
-					/* Close the session. */
+					/**
+					 * Close the session. 
+					 * Clean the cache as it can be used again after freed.
+					 */
+					list_del(&conn->h_cache.idle_list_index);
+					list_del(&conn->h_cache.bucket_list_index);
 					release_proxy_conn(conn, events + i + 1, nfds - 1 - i);
+					h_table_len_dec(conn->h_cache.table);
 					continue;
 				}
 				sendto(g_lsn_sock, buffer, rlen, 0, (struct sockaddr *)&conn->cli_addr,
