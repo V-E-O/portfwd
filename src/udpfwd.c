@@ -349,8 +349,8 @@ static int h_table_clear(struct h_table *ht)
 		list_del(&he->idle_list_index);
 		list_del(&he->bucket_list_index);
 
-		ht->ops->release(he);
 		h_table_len_dec(ht);
+		ht->ops->release(he);
 
 		count++;
 	}
@@ -388,8 +388,8 @@ static void __h_table_timeo_check(struct h_table *ht)
 		list_del(&he->idle_list_index);
 		list_del(&he->bucket_list_index);
 
-		ht->ops->release(he);
 		h_table_len_dec(ht);
+		ht->ops->release(he);
 	} /* while(!list_empty(&ht->idle_queue)) */
 	
 	printf("-- Live entries: %d\n", (int)ht->len);
